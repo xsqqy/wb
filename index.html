@@ -135,6 +135,49 @@
     z-index: 9999;
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* ===== 更新提示 banner ===== */
+  #sw-update-banner {
+    position: fixed;
+    left: 50%;
+    bottom: calc(20px + env(safe-area-inset-bottom));
+    transform: translateX(-50%);
+    background: #1d1d1f;
+    color: #fff;
+    padding: 12px 14px;
+    border-radius: 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.22);
+    z-index: 10000;
+    font-size: 13px;
+    max-width: calc(100vw - 32px);
+    box-sizing: border-box;
+    animation: swSlideUp .28s ease;
+  }
+  @keyframes swSlideUp {
+    from { transform: translateX(-50%) translateY(30px); opacity: 0; }
+    to { transform: translateX(-50%) translateY(0); opacity: 1; }
+  }
+  #sw-update-banner span { flex: 1; }
+  #sw-update-banner button {
+    border: none;
+    padding: 7px 13px;
+    border-radius: 9px;
+    font-size: 13px;
+    cursor: pointer;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  #sw-update-reload {
+    background: #0071e3;
+    color: #fff;
+  }
+  #sw-update-close {
+    background: rgba(255,255,255,.15);
+    color: #fff;
+  }
 </style>
 </head>
 <body>
@@ -719,39 +762,41 @@
     preview.classList.remove('dragging');
   });
 
+  // === 精确测量：用 getBBox 获取真实曲线边界（含弧度凸出部分）===
   function measureTailBounds() {
     const s = state;
+    const tailFill = $('tailFill');
+    const lb = tailFill.getBBox();  // 真实本地边界，含曲线
+
     const rot = s.rotOffset * Math.PI / 180;
     const cos = Math.cos(rot);
     const sin = Math.sin(rot);
-    
-    const pts = [
-      { x: 0, y: 0 },
-      { x: s.W, y: 0 },
-      { x: 0, y: s.H },
-      { x: s.W, y: s.H }
-    ];
-    
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    
-    pts.forEach(p => {
-      const px = p.x - s.W;
-      const py = p.y - s.H / 2;
-      const rx = px * cos - py * sin;
-      const ry = px * sin + py * cos;
-      
-      if (rx < minX) minX = rx;
-      if (rx > maxX) maxX = rx;
-      if (ry < minY) minY = ry;
-      if (ry > maxY) maxY = ry;
+
+    // path 根部中点在本地坐标 (W, H/2)
+    const cx = s.W, cy = s.H / 2;
+
+    const corners = [
+      { x: lb.x, y: lb.y },
+      { x: lb.x + lb.width, y: lb.y },
+      { x: lb.x, y: lb.y + lb.height },
+      { x: lb.x + lb.width, y: lb.y + lb.height }
+    ].map(p => {
+      const px = p.x - cx;
+      const py = p.y - cy;
+      return {
+        x: px * cos - py * sin,
+        y: px * sin + py * cos
+      };
     });
-    
-    return {
-      x: minX,
-      y: minY,
-      width: maxX - minX,
-      height: maxY - minY
-    };
+
+    const xs = corners.map(p => p.x);
+    const ys = corners.map(p => p.y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
 
   function measureCombinedBounds() {
@@ -763,12 +808,7 @@
     const minY = Math.min(bubble.y, tail.y);
     const maxY = Math.max(bubble.y + bubble.h, tail.y + tail.h);
 
-    return {
-      x: minX,
-      y: minY,
-      width: maxX - minX,
-      height: maxY - minY
-    };
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
 
   function buildExportSVG() {
@@ -785,8 +825,16 @@
     const vh = Math.max(1, bbox.height + 2 * pad);
 
     const scale = 3;
-    const outW = Math.max(1, Math.round(vw * scale));
-    const outH = Math.max(1, Math.round(vh * scale));
+    let outW = Math.max(1, Math.round(vw * scale));
+    let outH = Math.max(1, Math.round(vh * scale));
+
+    // iOS Safari canvas 上限保护（约 16M 像素）
+    const MAX_PIXELS = 16000000;
+    if (outW * outH > MAX_PIXELS) {
+      const ratio = Math.sqrt(MAX_PIXELS / (outW * outH));
+      outW = Math.floor(outW * ratio);
+      outH = Math.floor(outH * ratio);
+    }
 
     const { dFill, dStroke } = buildPaths(s.W, s.H, s.bt, s.bb, s.rr);
 
@@ -828,7 +876,6 @@ inner +
       canvas.width = outW;
       canvas.height = outH;
       const ctx = canvas.getContext('2d');
-      
       ctx.clearRect(0, 0, outW, outH);
       ctx.drawImage(img, 0, 0);
 
@@ -892,31 +939,48 @@ inner +
 
   update();
 
-  // ===== Service Worker 注册与自动更新 =====
+  // ===== PWA 注册与更新提示 =====
   if ('serviceWorker' in navigator) {
-    let refreshing = false;
+    let hadController = !!navigator.serviceWorker.controller;
+
     navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (refreshing) return;
-      if (navigator.serviceWorker.controller) {
-        refreshing = true;
-        window.location.reload();
+      hadController = true;
+    });
+
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      const data = event.data;
+      if (data && data.type === 'SW_UPDATED') {
+        // 首次安装不弹（避免新手困惑）
+        if (!hadController) return;
+        const seen = localStorage.getItem('sw-seen-v');
+        if (seen !== data.version) {
+          showUpdateBanner(data.version);
+        }
       }
     });
+
+    function showUpdateBanner(version) {
+      if (document.getElementById('sw-update-banner')) return;
+      const el = document.createElement('div');
+      el.id = 'sw-update-banner';
+      el.innerHTML =
+        '<span>新版本已就绪</span>' +
+        '<button id="sw-update-reload">立即刷新</button>' +
+        '<button id="sw-update-close">稍后</button>';
+      document.body.appendChild(el);
+      document.getElementById('sw-update-reload').onclick = () => {
+        try { localStorage.setItem('sw-seen-v', version); } catch (e) {}
+        window.location.reload();
+      };
+      document.getElementById('sw-update-close').onclick = () => {
+        try { localStorage.setItem('sw-seen-v', version); } catch (e) {}
+        el.remove();
+      };
+    }
 
     window.addEventListener('load', async () => {
       try {
         const reg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
-
-        reg.addEventListener('updatefound', () => {
-          const w = reg.installing;
-          if (!w) return;
-          w.addEventListener('statechange', () => {
-            if (w.state === 'installed' && navigator.serviceWorker.controller) {
-              w.postMessage({ type: 'SKIP_WAITING' });
-            }
-          });
-        });
-
         setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
         document.addEventListener('visibilitychange', () => {
           if (document.visibilityState === 'visible') {
